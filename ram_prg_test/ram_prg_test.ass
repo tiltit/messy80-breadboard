@@ -1,0 +1,21 @@
+; ---------------------------------------------------------------------;
+; Hello world program for Messy80 breadboard Z80 computer.             ;
+; ---------------------------------------------------------------------;
+
+#include "labels.ass"
+
+#target     rom                 ; declare target file format
+
+#code       $8200,$4000			; declare main code segment
+main:
+
+
+ram_prg_test:	
+	ld hl,it_works
+	call print_line
+	ret
+
+it_works	defm	"It works!"+$80
+
+#end
+

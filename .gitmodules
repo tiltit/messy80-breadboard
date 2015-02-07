@@ -1,0 +1,3 @@
+[submodule "utils/simple_eeprom_programmer"]
+	path = utils/simple_eeprom_programmer
+	url = https://github.com/tiltit/simple_eeprom_programmer.git

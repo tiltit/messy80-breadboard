@@ -1,0 +1,856 @@
+; ---------------------------------------------------------------------;
+; Messy80 breadboard Z80 computer.                                     ;
+; ---------------------------------------------------------------------;
+
+STACK_BASE			equ		$FFFF
+
+TIMER_CONTROL		equ		0
+
+UART_BASE			equ		20H
+
+UART_RX_BUFF		equ		UART_BASE + 0
+UART_TX_BUFF		equ		UART_BASE + 0
+UART_IER			equ		UART_BASE + 1
+UART_INT_ID			equ		UART_BASE + 2
+UART_FCR			equ		UART_BASE + 2
+UART_LCR			equ		UART_BASE + 3
+UART_MCR			equ		UART_BASE + 4
+UART_LINE_STATUS	equ		UART_BASE + 5
+UART_MODEM_STATUS	equ		UART_BASE + 6
+UART_SCRATCH		equ		UART_BASE + 7
+UART_DIVISOR_LSB	equ		UART_BASE + 0
+UART_DIVISOR_MSB	equ		UART_BASE + 1
+
+UART_TX_EMPTY		equ 	6
+UART_RX_READY		equ		0
+
+GPIO_BASE				equ		40H
+GPIO_PORTA				equ		GPIO_BASE + 0
+GPIO_PORTB				equ		GPIO_BASE + 1
+GPIO_PORTC				equ		GPIO_BASE + 2
+GPIO_CONTROL			equ		GPIO_BASE + 3
+
+
+#target     rom                 ; declare target file format
+
+#data   $8000,$200
+
+; Interupt jump table
+int_7			data	2		; 0
+int_6			data	2		; 2
+int_5			data	2		; 4
+int_4			data	2		; 6
+int_3			data	2		; 8
+int_2			data	2		; 10
+int_1			data	2		; 12
+int_0			data	2		; 14
+
+; Vars
+foo     			data    1	; 16
+cnt					data	1	; 17
+got_program			data	1	; 18
+program_pointer		data	2	; 19
+command_line		data	80	; 21
+command_line_ptr	data	2	; 101
+split_a				data	80	; 103
+split_b				data	80	; 183
+string_a			data	80	; 263
+jumpto				data	2
+
+
+#code		0,$2000				; start up code before nmi code segment
+	di	
+							; disable interupts
+	ld ix, STACK_BASE
+	ld sp,ix					; set up stack pointer
+	
+	; Set up interupt vector
+	IM 2						; Interupt mode 2
+	ld A,80H
+	ld I,A						; Set high byte of interupt mode 2 address to 82
+	
+	; Set up the interupt vector in ram
+	ld HL,int_timer
+	ld (int_7),HL
+	ld HL,int_byte_ready
+	ld (int_6),HL
+	ld HL,int_byte_ready
+	ld (int_5),HL
+	ld HL,int_byte_ready
+	ld (int_4),HL
+	ld HL,int_byte_ready
+	ld (int_3),HL
+	ld HL,int_byte_ready
+	ld (int_2),HL
+	ld HL,int_byte_ready
+	ld (int_1),HL
+	ld HL,int_byte_ready
+	ld (int_0),HL
+	
+	call setup_uart
+	call setup_gpio
+	
+	ld A,1
+	ld(cnt),A
+	
+	ld A, 1
+	out (TIMER_CONTROL), A		; Enable timer
+	
+	ei							; Enable interupts
+	
+main:
+	ld hl, str_wellcome
+	call print_line
+	ld HL, command_line;
+	ld (command_line_ptr), HL	;  setup the command line pointer
+	call print_command_prompt
+
+loop:
+	ld A,(cnt) 					; load foo in A
+	call display_byte			; display the value of A
+
+	ld A,00000011b				; set a to 1
+	out (UART_MCR),A			; set DTR and RTS high
+
+	ld bc,2
+	call delay
+
+	ld A,0						; set a yo 0
+	out (UART_MCR),A			; set all low
+
+	ld bc,2
+	call delay
+
+	in A,(UART_LINE_STATUS)
+	bit UART_RX_READY,A				; Test UART_RX_READY the see if there is any data available in the fifo
+	jr Z,no_new_bytes				; If not got to no_new_bytes
+	
+get_new_byte:
+	ld HL,(command_line_ptr)		; Get the current position of the commmand line pointer
+	in A,(UART_RX_BUFF)				; get the byte
+	
+	cp $0D					; Compare a to \r
+	jr Z, byte_is_cr
+	cp $0A					; Compare a to \n
+	jr Z, byte_is_lf
+
+byte_is_other:
+	ld (HL),A
+	inc HL
+	ld (command_line_ptr),HL
+	jr end_processing_byte
+	
+byte_is_cr:
+	dec HL
+	ld A,(HL)
+	add A,$80					; Last char in string
+	ld (HL),A
+	jr end_processing_byte
+
+byte_is_lf:
+	; call process_command
+	ld HL, command_line
+	call print_line
+	
+	ld HL, command_line
+	ld (command_line_ptr), HL	; Reset the command line pointer
+	
+	;ld HL, command_line
+	call proccess_command
+	
+	ld A,'#'						; new command line
+	call print_char
+	
+end_processing_byte:
+	in A,(UART_LINE_STATUS)
+	bit UART_RX_READY,A				; Test UART_RX_READY the see if there is any more data available in the fifo
+	jr Z,no_new_bytes				; If not got to no_new_bytes
+	JP get_new_byte
+	
+no_new_bytes:
+	JP loop
+
+; -------------------------------------------------------------------- ;
+;                             Subroutines                              ;
+; -------------------------------------------------------------------- ;
+
+; -------------------------------------------
+; proccess_command
+; proccesses a command from string pointed 
+; to by HL
+; -------------------------------------------
+proccess_command:
+	; Split the string into 2
+	; HL contains the command
+	ld IX, split_a
+	ld IY, split_b
+	ld B,' '			; space is the delimiter
+	call split_in_two
+	
+is_cmd_0:
+	ld IX, split_a
+	ld IY, cmd_hex2bin_8
+	call string_compare
+	jr NZ,	is_cmd_1
+	ld HL, split_b
+	call command_hex_to_bin_8
+	jr proccess_command_end
+	
+is_cmd_1:
+	ld IX, split_a
+	ld IY, cmd_hex2bin_16
+	call string_compare
+	jr NZ,	is_cmd_2
+	ld HL, split_b
+	call command_hex_to_bin_16
+	jr proccess_command_end
+
+is_cmd_2:
+	ld IX, split_a
+	ld IY, cmd_read_address
+	call string_compare
+	jr NZ, is_cmd_3
+	ld HL, split_b
+	call command_read_address
+	jr proccess_command_end
+
+is_cmd_3:
+	ld IX, split_a
+	ld IY, cmd_write_address
+	call string_compare
+	jr NZ, is_cmd_4
+	ld HL, split_b
+	call command_write_address
+	jr proccess_command_end
+
+is_cmd_4:
+	ld IX, split_a
+	ld IY, cmd_io_out
+	call string_compare
+	jr NZ, is_cmd_5
+	ld HL, split_b
+	call command_write_io
+	jr proccess_command_end
+
+is_cmd_5:
+	ld IX, split_a
+	ld IY, cmd_call_address
+	call string_compare
+	jr NZ, is_cmd_6
+	ld HL, split_b
+	call command_call_address
+	jr proccess_command_end
+
+is_cmd_6:
+	ld HL, str_error_unknown_cmd
+	call print_line
+		
+proccess_command_end:
+
+	ret
+
+; ---------------------------------------------
+; command_call_address
+; ---------------------------------------------
+command_call_address:
+	call hex_to_bin_16
+	ld HL, command_call_address_return
+	push HL
+	ld HL, DE
+	jp (HL)
+command_call_address_return:
+	ld HL, str_success
+	call print_line
+	ret
+	
+test_call_address:
+	ld HL, str_true
+	call print_line
+	ret
+
+; ---------------------------------------------
+; command_write_io
+; input: HL argument string
+; command ex: io_out 40,FF
+; ---------------------------------------------
+command_write_io:
+	ld DE, string_a
+	call string_copy
+	
+	ld HL, string_a
+	ld IX, split_a
+	ld IY, split_b
+	ld B, ','					; This is the delimiter
+	call split_in_two			; Split string in two
+	
+	ld HL, split_a
+	call hex_to_bin_8
+	ld C,A
+	push BC
+	ld HL, split_b
+	call hex_to_bin_8
+	pop BC
+	out (C),A					; Write byte to address
+	ret
+
+; ---------------------------------------------
+; command_read_io
+; input: HL argument string
+; command ex: io_in 40
+; ---------------------------------------------
+command_read_io:
+	call hex_to_bin_8
+	ld C, A
+	in A, (C)
+	ld C, A
+	call bin_to_hex_8
+	ld A,H
+	call print_char
+	ld A,L
+	call print_char
+	call new_line
+	ret
+
+
+; ---------------------------------------------
+; command_write_address
+; input: HL contains the command argument
+; ---------------------------------------------
+command_write_address:
+	ld DE, string_a
+	call string_copy
+	
+	ld HL, string_a
+	ld IX, split_a
+	ld IY, split_b
+	ld B, ','					; This is the delimiter
+	call split_in_two
+	ld HL, split_a
+	call hex_to_bin_16
+	push DE						; Save result
+	ld HL, split_b
+	call hex_to_bin_8
+	pop DE
+	LD HL, DE
+	ld (HL),A					; Write byte to address
+	ret
+
+; ---------------------------------------------
+; command_read_address
+; input: HL contains the command argument
+; ---------------------------------------------
+command_read_address:
+	call hex_to_bin_16
+	ld HL, DE
+	;ld A,(HL)
+	;call print_char
+	ld C,(HL)
+	call bin_to_hex_8
+	ld A,H
+	call print_char
+	ld A,L
+	call print_char
+	call new_line
+	ret
+
+; ---------------------------------------------
+; command_hex_to_bin_8
+; converts a 2 byte hex string into binary data
+; ex: h2b 
+; input: HL contains the command argument
+; ---------------------------------------------
+command_hex_to_bin_8:
+	ld HL, split_b		; This is where the hex string is
+	call hex_to_bin_8
+	call print_char
+	call new_line
+	ret
+; ---------------------------------------------
+; command_hex_to_bin_16
+; input: HL contains the command argument
+; ---------------------------------------------
+
+command_hex_to_bin_16:
+	ld HL, split_b		; This is where the hex string is
+	call hex_to_bin_16
+	ld A, D
+	call print_char
+	ld A, E
+	call print_char
+	call new_line
+	ret
+	
+; ---------------------------------------------
+; hex_to_bin_4
+; Converts a single hex digit into binary
+; input A
+; output E
+; --------------------------------------------
+hex_to_bin_4:
+	ld IX, hex_digits
+	ld B, 16
+	ld E, 0
+hex_to_bin_4_loop:
+	ld C, (IX)
+	res 7, C
+	CP C
+	jr Z, end_hex_to_bin_4_loop
+	inc IX
+	inc E
+	djnz hex_to_bin_4_loop
+end_hex_to_bin_4_loop:
+	ret
+
+; -------------------------------------------
+; bin_to_hex_8
+; input: C
+; ouput: HL
+; -------------------------------------------
+bin_to_hex_8:
+	ld A, C
+	rra						; rotate right 4 times
+	rra
+	rra
+	rra
+	call bin_to_hex_8_conv
+	ld H, L
+	ld A, C
+bin_to_hex_8_conv:
+	and $0F					; Mask the 4 most significant bits
+	add A, $90				; add 0x90 to A
+	daa						; C flag and H flag should be 0
+							; Higher value is 0x9
+							; If lower value 0-9 adds 0
+							; If lower value A-F adds 0x66
+	adc A, $40
+	daa
+	ld L, A
+	ret
+
+
+; -------------------------------------------
+; hex_to_bin_8
+; Input: HL start of 2 byte hex string
+; Output A
+; -------------------------------------------
+hex_to_bin_8:
+	ld A,(HL)
+	call hex_to_bin_4	; Convert the first digit
+	rlc E				; Rotate result left 4 times
+	rlc E
+	rlc E
+	rlc E
+	ld D,0
+	push DE				; Save for later
+	inc HL
+	ld A,(HL)
+	res 7,A				; Reset bit 7 of A to 0
+	call hex_to_bin_4	; Convert the second digit
+	ld A,E
+	pop DE
+	add A,E				; The two 4 bit words are added
+	ret
+
+; -------------------------------------------
+; hex_to_bin_16
+; Input: HL start of 2 byte hex string
+; Output DE
+; -------------------------------------------
+hex_to_bin_16:
+	ld A,(HL)			; First digit
+	call hex_to_bin_4	; Convert
+	rlc E				; Rotate result left 4 times
+	rlc E
+	rlc E
+	rlc E
+	ld D,E
+	push DE				; Save for later
+	inc HL
+	ld A,(HL)			; Second digit
+	call hex_to_bin_4	; Convert
+	ld A,E
+	pop DE
+	add A,D				; The two 4 bit words are added
+	ld D,A
+	push DE
+	inc HL
+	ld A,(HL)			; Third digit
+	call hex_to_bin_4	; Convert
+	rlc E				; Rotate result left 4 times
+	rlc E
+	rlc E
+	rlc E
+	ld A,E
+	pop DE
+	ld E,A
+	push DE
+	inc HL
+	ld A, (HL)			; Fourth and last digit
+	res 7, A			; Reset the end of string bit
+	call hex_to_bin_4	; Convert
+	ld A,E
+	pop DE
+	add A,E
+	ld E,A				; We have the filnal result
+	ret
+
+; ---------------------------------------------
+; string_len
+; input: HL Points to the string
+; output: A The string length
+; ---------------------------------------------
+string_len:
+	push HL
+	ld A,0					; Reset A
+	ld B,80					; 80 is the maximum length of a string
+string_len_loop:
+	inc A
+	ld C,(HL)
+	bit 7,C
+	jr NZ, string_len_loop_end
+	inc HL
+	djnz string_len_loop	; dec B; if b!=0 jump
+string_len_loop_end:
+	pop HL
+	ret
+
+; ---------------------------------------------
+; string_copy
+; input: HL Points to the source string
+; input: DE Points to the target string B
+; ---------------------------------------------
+string_copy:
+	push HL
+	push DE
+	call string_len
+	; The folowing have already been set.
+	;ld HL, string_source
+	;ld DE, string_target
+	ld B, 0
+	ld C, A					; load the string length into C
+	ldir
+	pop DE
+	pop HL
+	ret
+
+
+; --------------------------------------
+; string_compare
+; String A is pointed to by IX
+; String B is pointed to by IY
+; If compare is true the Z flag is set
+; --------------------------------------
+string_compare:
+	push IX
+	push IY
+string_compare_loop:
+	ld A, (IX)
+	ld B, (IY)
+	cp B
+	jr NZ, string_compare_false
+	bit 7,A
+	jr NZ, string_compare_true		; End of string
+	inc IX
+	inc IY
+	jr string_compare_loop
+string_compare_true:
+	cp A							; Set zero flag
+	jr string_compare_end
+string_compare_false:
+	or 1							; Reset zero flag
+string_compare_end:
+	pop IY
+	pop IX
+	ret
+
+; -------------------------------------------
+; split_in_two
+; Subroutine to split a string into 2
+; delimiter Should be in B
+; HL points to the string to be split
+; IX points to target string A
+; IY points to target string B
+; -------------------------------------------
+split_in_two:
+	ld A,(HL)
+	bit 7,A
+	jr Z, not_end_of_string		; Check if string ends before the delimiter
+	ld (IX),A
+	jr end_of_string_b
+	
+not_end_of_string:
+	CP B
+	jr Z, char_is_delimiter
+	ld (IX),A
+	inc IX
+	inc HL
+	jr split_in_two
+char_is_delimiter:
+	dec IX
+	ld A,(IX)
+	add A,$80					; End the first string
+	ld (IX),A
+while_delimiter:
+	inc HL
+	ld A,(HL)
+	cp B
+	jr NZ, second_string
+	jr while_delimiter
+second_string:
+	ld A,(HL)
+	bit 7,A
+	jr NZ, end_of_string_b
+	ld (IY),A
+	inc IY
+	inc HL
+	jr second_string
+	
+end_of_string_b:
+	ld A,(HL)
+	ld (IY),A
+	ret
+; -------------------------
+; delay subroutine
+; delay of BC X DE
+; My first subroutine :)
+; -------------------------
+delay:
+	ld DE, 0100h
+inner:
+	dec de
+	ld a, d
+	or e
+	jp nz, inner
+	dec bc
+	ld a,b
+	or c
+	jp nz, delay
+	ret
+
+; -------------------------------------
+; print_char subroutine
+; Outputs the content of A to the uart
+; -------------------------------------
+print_char:
+	out (UART_TX_BUFF),A		; output byte
+wait_end_tx:
+	IN A,(UART_LINE_STATUS)		; poll for end of transmission
+	bit UART_TX_EMPTY,A
+	jr Z,wait_end_tx
+	ret
+	
+	
+get_char_block:
+	in A,(UART_LINE_STATUS) ;  poll receive data ready-bit
+	bit UART_RX_READY,A
+	jr Z,get_char_block
+	in A,(UART_RX_BUFF)
+	ret
+	
+	
+get_char:
+	in A,(UART_LINE_STATUS) ;  poll receive data ready-bit
+	bit UART_RX_READY,A
+	jr Z,no_input
+	in A,(UART_RX_BUFF)
+	ld B, $FF
+	ret
+no_input:
+	ld B, 0
+	ret
+	
+; ---------------------------------------
+; new_line
+; prints out \r\n
+; --------------------------------------
+new_line:
+	ld A,$0D					; Load \r into A
+	call print_char				; Print \r
+	ld A,$0A					; Load \n into A
+	call print_char				; Print \n
+	ret
+	
+; ---------------------------------------
+; Print_line
+; HL points to the begining of the string
+; Adds \r\n to the end of the line
+; ---------------------------------------
+print_line:
+	push hl
+print_line_loop:
+	ld A,(HL)					; Load the char into A
+	bit 7,A						; Test bit 7 on A
+	jr NZ, line_end				; If bit 7 is set then Z is not 0, jump to line end
+	call print_char				; else print the char in A
+	inc HL						; incremant hl to point to the next char
+	jp print_line_loop			; start over for the next char
+line_end:						; This is the last char
+	res 7,A						; Reset bit 7 of A to 0
+	call print_char				; Print A
+	ld A,$0D					; Load \r into A
+	call print_char				; Print \r
+	ld A,$0A					; Load \n into A
+	call print_char				; Print \n
+	pop hl
+	ret
+	
+; ---------------------------------------
+; Print_string
+; HL points to the begining of the string
+; Same as above without \r\n
+; ---------------------------------------
+print_string:
+	ld A,(HL)					; Load the char into A
+	bit 7,A						; Test bit 7 on A
+	jr NZ, print_string_line_end				; If bit 7 is set then Z is not 0, jump to line end
+	call print_char				; else print the char in A
+	inc HL						; incremant hl to point to the next char
+	jp print_string				; start over for the next char
+print_string_line_end:						; This is the last char
+	res 7,A						; Reset bit 7 of A to 0
+	call print_char				; Print A
+	ret
+	
+; --------------------------------------
+; print_command_prompt
+; --------------------------------------
+print_command_prompt:
+	ld A,$0D					; Load \r into A
+	call print_char				; Print \r
+	ld A,$0A					; Load \n into A
+	call print_char				; Print \n
+	ld A,'#'					; Load \n into A
+	call print_char				; Print \n
+	ret
+
+; ----------------------------------------------------------------------
+; displays the value of A onto a 7 segment display driven by a 82c55
+; ----------------------------------------------------------------------
+display_byte:
+	ld D,A						; Save the value of A into D
+	ld b,00001111b
+	and b						; Mask the four most significant bits in A
+	ld c,a
+	ld b,0
+	ld hl, digits
+	add hl, bc
+	ld a,(hl)
+	out (GPIO_PORTB),a			; output A on 8255 PORTB
+	ld A, D						; reload the original value of A from D
+	rrca						; rotate A right 4 times
+	rrca
+	rrca
+	rrca
+	ld B,00001111b
+	and B						; a = a and b
+	ld c,a						; set lower half of bc to A
+	ld b,0						; set higher half of bc to 0
+	ld hl, digits				; load the address of digits in hl
+	add hl, bc					; add bc to hl
+	ld a,(hl)					; load the data at hl to a
+	out (GPIO_PORTA),a			; output A on 8255 PORTA
+	ret
+	
+; -------------------------------------------------------------------- ;
+;                           setup_routines                             ;
+; -------------------------------------------------------------------- ;
+
+setup_uart:
+	ld A,80H					; DLE on
+	out (UART_LCR),A			; activate dlab bit to access to divisor registers
+
+	ld A,12						; 9600 baud
+	out (UART_DIVISOR_LSB),A	; LSB of divisor
+
+	
+	ld A,0						; MSB of divisor
+	out (UART_DIVISOR_MSB),A
+
+	ld A,03H					; 8 data bits, no parity, one stop bit (8N1)
+	out (UART_LCR),A
+	
+	ld A,11000111b
+	out (UART_FCR),A			; Enable fifo 14 byte trigger level
+	
+	;ld A, 00000001b				; Enable received data available interupt
+	ld A, 00000000b				; Disable all interupts
+	out (UART_IER), A
+	ret
+	
+setup_gpio:
+	ld A,80H 					; 1000 0000 - tell the 82C55 to set all ports to outputs
+	out (GPIO_CONTROL),A					; 0x03 is the control word address
+	ld A,255	
+	out (GPIO_PORTB),A				; 82c55 port B
+	ret
+	
+; ---------------------------------------------------------------------;
+;                              Interupts                               ;
+; ---------------------------------------------------------------------;
+
+; -------------------------
+; UART Byte ready interupt
+; -------------------------
+int_byte_ready:
+	ex AF,AF'
+	exx
+	
+	in A,(UART_LINE_STATUS) 	;  poll receive data ready-bit
+	bit UART_RX_READY,A
+	jr Z,int_byte_ready_no_input
+	in A,(UART_RX_BUFF)
+	call print_char
+	
+int_byte_ready_no_input:
+	ex AF,AF'
+	exx
+	ei
+	ret
+; ------------------
+; Timer interupt
+; ------------------
+int_timer:
+	ex AF,AF'
+	exx
+	ld a,(cnt)					; load cnt in A
+	inc a						; increment A
+	ld (cnt), a					; save cnt to foo
+	
+	ld A, 0			
+	out (TIMER_CONTROL), A		; Reset the flipflop
+	nop							; Wait a bit
+	ld A, 1						
+	out (TIMER_CONTROL), A		; reenable the flipflop
+	
+	ex AF,AF'
+	exx
+	ei
+	ret
+
+	
+; ----------------------------------------------------------------------
+;                     strings and static data                          ;
+; ----------------------------------------------------------------------
+
+digits					defm	7B6057766C3E3F707F7E7D2F1B671F1Dh	; this is to display 0..F on a 7 segment display connected to a 8255 port 
+command_prompt			defm	"#"+$80
+hex_digits				defm	"0123456789ABCDEF"+$80
+
+str_wellcome			defm	"Wellcome to the Messy80"+$80
+str_true				defm	"true"+$80
+str_false				defm	"false"+$80
+str_success				defm	"Success"+$80
+str_error_unknown_cmd	defm	"Unknown command"+$80
+
+; -----------------------------------
+; monitor commands
+; -----------------------------------
+cmd_hex2bin_8			defm	"hb8"+$80
+cmd_hex2bin_16			defm	"hb16"+$80
+cmd_read_address		defm	"ra"+$80
+cmd_write_address		defm	"wa"+$80
+cmd_io_out				defm	"io_out"+$80
+cmd_io_in				defm	"io_in"+$80
+cmd_call_address		defm	"ca"+$80
+
+#end
